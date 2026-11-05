@@ -35,7 +35,7 @@ DECLARE_XAM_EXPORT1(XMsgInProcessCall, kNone, kImplemented);
 dword_result_t XMsgSystemProcessCall_entry(dword_t app, dword_t message,
                                            dword_t buffer,
                                            dword_t buffer_length) {
-  auto result = kernel_state()->app_manager()->DispatchMessageAsync(
+  auto result = kernel_state()->app_manager()->DispatchMessageSync(
       app, message, buffer, buffer_length);
   if (result == X_ERROR_NOT_FOUND) {
     XELOGE("XMsgSystemProcessCall: app {:08X} undefined",
@@ -50,19 +50,20 @@ X_HRESULT xeXMsgStartIORequestEx(uint32_t app, uint32_t message,
                                  uint32_t buffer_length,
                                  X_TASK_ARGS* xam_task_args_ptr) {
   auto result = kernel_state()->app_manager()->DispatchMessageAsync(
-      app, message, buffer_ptr, buffer_length);
-  if (result == X_E_NOTFOUND) {
+      app, message, buffer_ptr, buffer_length, overlapped_ptr);
+
+  if (result == X_E_NOTFOUND && !kernel_state()->app_manager()->HasApp(app)) {
     XELOGE("XMsgStartIORequestEx: app {:08X} undefined", app);
     result = X_E_INVALIDARG;
     XThread::SetLastError(X_ERROR_NOT_FOUND);
+  } else if (!overlapped_ptr && XFAILED(result)) {
+    XThread::SetLastError(result);
   }
-  if (overlapped_ptr) {
-    kernel_state()->CompleteOverlappedImmediate(overlapped_ptr, result);
-    result = X_ERROR_IO_PENDING;
-  }
+
   if (result == X_ERROR_SUCCESS || result == X_ERROR_IO_PENDING) {
     XThread::SetLastError(0);
   }
+
   return result;
 }
 
@@ -85,6 +86,12 @@ DECLARE_XAM_EXPORT1(XMsgStartIORequest, kNone, kImplemented);
 
 dword_result_t XMsgCancelIORequest_entry(
     pointer_t<XAM_OVERLAPPED> overlapped_ptr, dword_t wait) {
+  // Prevent a cancelled request from completing later, games reuse the
+  // overlapped for their next request e.g. 58410840.
+  if (kernel_state()->CancelOverlapped(overlapped_ptr.guest_address(), wait)) {
+    return 0;
+  }
+
   X_HANDLE event_handle = XOverlappedGetEvent(overlapped_ptr);
   if (event_handle && wait) {
     auto ev =

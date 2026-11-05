@@ -39,6 +39,7 @@
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/hid/input_driver.h"
 #include "xenia/hid/input_system.h"
+#include "xenia/kernel/XLiveAPI.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
@@ -61,6 +62,12 @@
 #include "xenia/vfs/devices/null_device.h"
 #include "xenia/vfs/devices/xcontent_container_device.h"
 #include "xenia/vfs/virtual_file_system.h"
+
+#if XE_PLATFORM_WIN32
+#include "xenia/kernel/util/network_adapter_manager_win.h"
+#elif XE_PLATFORM_LINUX
+#include "xenia/kernel/util/network_adapter_manager_linux.h"
+#endif
 
 #if XE_ARCH_AMD64
 #include "xenia/cpu/backend/x64/x64_backend.h"
@@ -95,6 +102,8 @@ DEFINE_int32(priority_class, 0,
 
 DECLARE_int32(console_type);
 
+DECLARE_bool(upnp);
+
 namespace xe {
 using namespace xe::literals;
 
@@ -114,6 +123,7 @@ Emulator::Emulator(const std::filesystem::path& command_line,
     : on_launch(),
       on_terminate(),
       on_exit(),
+      on_presence_change(),
       command_line_(command_line),
       storage_root_(storage_root),
       content_root_(content_root),
@@ -140,6 +150,16 @@ Emulator::Emulator(const std::filesystem::path& command_line,
       XELOGI("Higher priority class request: Successful. New priority: {}",
              cvars::priority_class);
     }
+  }
+
+  xbox_live_api_ = std::make_unique<kernel::XLiveAPI>();
+  network_adapter_manager_ = std::make_unique<kernel::NetworkAdapterManager>();
+  upnp_ = std::make_unique<kernel::UPnP>();
+
+  network_adapter_manager_->Initialize();
+
+  if (cvars::upnp) {
+    upnp_->Initialize();
   }
 
 #if XE_PLATFORM_WIN32 == 1
@@ -188,6 +208,9 @@ Emulator::~Emulator() {
   processor_.reset();
 
   export_resolver_.reset();
+
+  upnp_.reset();
+  network_adapter_manager_.reset();
 
   ExceptionHandler::Uninstall(Emulator::ExceptionCallbackThunk, this);
 }
@@ -1169,6 +1192,21 @@ X_STATUS Emulator::CreateZarchivePackage(
   return X_STATUS_SUCCESS;
 }
 
+void Emulator::DumpXLast() {
+  if (game_info_database_) {
+    if (game_info_database_->GetXLast()) {
+      const std::string title_ver =
+          title_version().empty() ? "" : " - " + title_version();
+      const std::string filename =
+          fmt::format("{:08X}{}.xml", title_id(), title_ver);
+
+      game_info_database_->GetXLast()->Dump(storage_root() / filename);
+    } else {
+      XELOGI("XLast data not found");
+    }
+  }
+}
+
 void Emulator::Pause() {
   if (paused_) {
     return;
@@ -1465,6 +1503,9 @@ bool Emulator::ExceptionCallback(Exception* ex) {
     });
   }
 
+  GetXboxLiveAPI()->DeleteAllSessionsByMac();
+  kernel_state()->xam_state()->StopPeriodicMaintenance();
+
   // Now suspend ourself (we should be a guest thread).
   current_thread->Suspend(nullptr);
 
@@ -1678,6 +1719,8 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
     kernel_state_->xam_state()->LoadSpaInfo(db.get());
 
     kernel_state_->xam_state()->user_tracker()->AddTitleToPlayedList();
+    kernel_state_->xam_state()->user_tracker()->AddDefaultProperties();
+    kernel_state_->xam_state()->user_tracker()->AddDefaultContexts();
 
     if (game_info_database_->IsValid()) {
       title_name_ = game_info_database_->GetTitleName(static_cast<XLanguage>(
@@ -1846,6 +1889,20 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
                                        module->hash().value());
     }
   }
+
+  if (cvars::upnp) {
+    upnp_->Start();
+  }
+
+  // 565507E0, and 415607F2 don't call XNetStartup or WSAStartup.
+  // Initialize server connection ourself.
+  // Titles can still be logged into Xbox-Live even if network layer isn't
+  // initialized.
+  // Initialize before title calls any XNet functions that depend on XNADDR e.g.
+  // NetDll_XNetGetTitleXnAddr
+  kernel_state()->GetXboxLiveAPI()->Init();
+
+  kernel_state()->xam_state()->StartPeriodicMaintenance();
 
   // Resume the main thread now.
   // If the debugger has requested a suspend this will just decrement the

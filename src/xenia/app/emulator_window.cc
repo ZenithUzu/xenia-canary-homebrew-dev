@@ -22,6 +22,7 @@
 
 #include "xenia/app/console_settings_dialog.h"
 #include "xenia/app/content_list_dialog.h"
+#include "xenia/app/port_permission_dialog.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
@@ -36,6 +37,7 @@
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/hid/input_system.h"
+#include "xenia/kernel/XLiveAPI.h"
 #include "xenia/kernel/xam/profile_manager.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xam_state.h"
@@ -64,10 +66,23 @@ DECLARE_string(readback_resolve);
 
 DECLARE_bool(readback_memexport);
 
+DECLARE_string(api_address);
+
+DECLARE_string(api_list);
+
+DECLARE_bool(upnp);
+
+DECLARE_string(network_guid);
+
 DEFINE_bool(fullscreen, false, "Whether to launch the emulator in fullscreen.",
             "Display");
 
 DEFINE_bool(controller_hotkeys, false, "Hotkeys for Xbox and PS controllers.",
+            "General");
+
+DEFINE_bool(auto_check_updates, true,
+            "Automatically check for updates on startup and notify if any are "
+            "available.",
             "General");
 
 DEFINE_string(
@@ -167,7 +182,7 @@ using namespace xe::hid;
 using namespace xe::gpu;
 
 constexpr std::string_view kRecentlyPlayedTitlesFilename = "recent.toml";
-constexpr std::string_view kBaseTitle = "Xenia-canary";
+constexpr std::string_view kBaseTitle = "Xenia-canary-netplay";
 
 EmulatorWindow::EmulatorWindow(Emulator* emulator,
                                ui::WindowedAppContext& app_context,
@@ -177,7 +192,7 @@ EmulatorWindow::EmulatorWindow(Emulator* emulator,
       window_listener_(*this),
       window_(ui::Window::Create(app_context, kBaseTitle, width, height)),
       imgui_drawer_(
-          std::make_unique<ui::ImGuiDrawer>(window_.get(), kZOrderImGui)),
+          std::make_shared<ui::ImGuiDrawer>(window_.get(), kZOrderImGui)),
       display_config_game_config_load_callback_(
           new DisplayConfigGameConfigLoadCallback(*emulator, *this)) {
   base_title_ = std::string(kBaseTitle) +
@@ -194,6 +209,8 @@ EmulatorWindow::EmulatorWindow(Emulator* emulator,
 #endif
                 XE_BUILD_BRANCH "@" XE_BUILD_COMMIT_SHORT " on " XE_BUILD_DATE
                 ")";
+
+  updater_ = std::make_shared<Updater>("AdrianCassar", "xenia-canary");
 
   LoadRecentlyLaunchedTitles();
 }
@@ -213,6 +230,12 @@ std::unique_ptr<EmulatorWindow> EmulatorWindow::Create(
 EmulatorWindow::~EmulatorWindow() {
   // Notify the ImGui drawer that the immediate drawer is being destroyed.
   ShutdownGraphicsSystemPresenterPainting();
+}
+
+void EmulatorWindow::ShutdownUpdaterDialog() {
+  // Cancel checking for updates.
+  cancel_request = true;
+  updater_dialog_.reset();
 }
 
 ui::Presenter* EmulatorWindow::GetGraphicsSystemPresenter() const {
@@ -265,6 +288,10 @@ void EmulatorWindow::OnEmulatorInitialized() {
     disable_hotkeys_ = true;
   }
 
+#if XE_PLATFORM_LINUX
+  PortPermissionDialog::ShowIfNeeded(imgui_drawer_.get());
+#endif
+
   emulator_initialized_ = true;
   window_->SetMainMenuEnabled(true);
   // When the user can see that the emulator isn't initializing anymore (the
@@ -285,6 +312,45 @@ void EmulatorWindow::OnEmulatorInitialized() {
         threading::Thread::Create({}, [&] { GamepadHotKeys(); });
     Gamepad_HotKeys_Listener->set_name("Gamepad HotKeys Listener");
   }
+
+  // Check for updates
+#if !defined(DEBUG) && !defined(XE_BUILD_IS_PR)
+  bool should_check_update = cvars::auto_check_updates &&
+                             !(cvar::updated_arg_present && cvar::updated);
+
+  auto callback = [this](CheckForUpdateInfo update_info) {
+    if (update_info.update_available) {
+      app_context_.CallInUIThread([this, update_info]() {
+        ShowUpdateAvailableDialog(update_info.metadata.commit_hash,
+                                  update_info.metadata.commit_date);
+      });
+    }
+  };
+
+  if (should_check_update) {
+    update_info_ = updater_->StartupUpdateCheckAsync(cancel_request, callback);
+  }
+#endif
+
+  if (emulator_->kernel_state()
+          ->xam_state()
+          ->user_tracker()
+          ->LoggedInToLive()) {
+    emulator()->GetXboxLiveAPI()->StartWhoamiAsync();
+  }
+}
+
+void EmulatorWindow::ShowUpdateAvailableDialog(const std::string& commit,
+                                               const std::string& date) {
+  std::string title_text = "Update Available";
+  std::string short_commit = commit.substr(0, 9);
+  std::string message = fmt::format(
+      "Date: {} ({})\n\n"
+      "You can update via the Netplay -> Update Checker menu",
+      date, short_commit);
+
+  new xe::ui::HostNotificationWindow(imgui_drawer_.get(), title_text, message,
+                                     0, 9);
 }
 
 void EmulatorWindow::EmulatorWindowListener::OnClosing(ui::UIEvent& e) {
@@ -779,6 +845,9 @@ bool EmulatorWindow::Initialize() {
     file_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, "Show content directory...",
         std::bind(&EmulatorWindow::ShowContentDirectory, this)));
+    file_menu->AddChild(
+        MenuItem::Create(MenuItem::Type::kString, "Dump XLast",
+                         std::bind(&EmulatorWindow::DumpXLast, this)));
     file_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
     file_menu->AddChild(
         MenuItem::Create(MenuItem::Type::kString, "E&xit", "Alt+F4",
@@ -792,6 +861,9 @@ bool EmulatorWindow::Initialize() {
     profile_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, "&Show Profile Menu", "",
         std::bind(&EmulatorWindow::ToggleProfilesConfigDialog, this)));
+    profile_menu->AddChild(MenuItem::Create(
+        MenuItem::Type::kString, "&Gamerpic Browser", "",
+        std::bind(&EmulatorWindow::ToggleGamerpicBrowserDialog, this)));
   }
   main_menu->AddChild(std::move(profile_menu));
 
@@ -909,6 +981,29 @@ bool EmulatorWindow::Initialize() {
   }
   main_menu->AddChild(std::move(console_menu));
 
+  // Netplay menu.
+  auto Netplay_menu = MenuItem::Create(MenuItem::Type::kPopup, "&Netplay");
+  {
+    Netplay_menu->AddChild(MenuItem::Create(
+        MenuItem::Type::kString, "&Status", "",
+        std::bind(&EmulatorWindow::ToggleNetplayStatusDialog, this)));
+
+    Netplay_menu->AddChild(MenuItem::Create(
+        MenuItem::Type::kString, "&Settings", "",
+        std::bind(&EmulatorWindow::ToggleNetplaySettingsDialog, this)));
+
+    Netplay_menu->AddChild(MenuItem::Create(
+        MenuItem::Type::kString, "&Manager", "",
+        std::bind(&EmulatorWindow::ToggleFriendsDialog, this)));
+
+    Netplay_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
+
+    Netplay_menu->AddChild(MenuItem::Create(
+        MenuItem::Type::kString, "&Update Checker",
+        std::bind(&EmulatorWindow::ToggleUpdaterDialog, this)));
+  }
+  main_menu->AddChild(std::move(Netplay_menu));
+
   // Help menu.
   auto help_menu = MenuItem::Create(MenuItem::Type::kPopup, "&Help");
   {
@@ -926,7 +1021,7 @@ bool EmulatorWindow::Initialize() {
     help_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, "Recent changes on GitHub...", []() {
           LaunchWebBrowser(
-              "https://github.com/xenia-canary/xenia-canary/"
+              "https://github.com/AdrianCassar/xenia-canary/"
               "compare/" XE_BUILD_COMMIT "..." XE_BUILD_BRANCH);
         }));
     help_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
@@ -1587,6 +1682,8 @@ void EmulatorWindow::ShowContentDirectory() {
   LaunchFileExplorer(content_root);
 }
 
+void EmulatorWindow::DumpXLast() { emulator()->DumpXLast(); }
+
 void EmulatorWindow::CpuTimeScalarReset() {
   Clock::set_guest_time_scalar(1.0);
   UpdateTitle();
@@ -1647,6 +1744,20 @@ void EmulatorWindow::ToggleFullscreen() {
   SetFullscreen(!window_->IsFullscreen());
 }
 
+void EmulatorWindow::SetAutoCheckForUpdates(bool state) {
+  OVERRIDE_bool(auto_check_updates, state);
+}
+
+void EmulatorWindow::UpdateCompletionNotification() {
+  app_context_.CallInUIThread([&]() {
+    std::string message = fmt::format("Build Date: {} ({})", XE_BUILD_DATE,
+                                      XE_BUILD_COMMIT_SHORT);
+
+    new xe::ui::HostNotificationWindow(imgui_drawer(), "Update Completed",
+                                       message.c_str(), 0, 9);
+  });
+}
+
 void EmulatorWindow::ToggleDisplayConfigDialog() {
   if (!display_config_dialog_) {
     display_config_dialog_ =
@@ -1682,6 +1793,33 @@ void EmulatorWindow::ToggleProfilesConfigDialog() {
       profile_config_dialog_.release();
     } else {
       profile_config_dialog_.reset();
+    }
+    emulator_->kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
+  }
+}
+
+void EmulatorWindow::ToggleGamerpicBrowserDialog() {
+  if (!gamerpic_browser_dialog_) {
+    disable_hotkeys_ = true;
+
+    if (emulator_->kernel_state()->xam_state()->IsUIActive()) {
+      return;
+    }
+
+    emulator_->kernel_state()->BroadcastNotification(kXNotificationSystemUI,
+                                                     true);
+    emulator_->kernel_state()->xam_state()->is_xam_dialog_present_.store(true);
+
+    gamerpic_browser_dialog_ =
+        TitleGamerpicBrowser::Create(imgui_drawer_.get(), this);
+  } else {
+    disable_hotkeys_ = false;
+    emulator_->kernel_state()->BroadcastNotification(kXNotificationSystemUI,
+                                                     false);
+    if (gamerpic_browser_dialog_->IsClosing()) {
+      gamerpic_browser_dialog_.release();
+    } else {
+      gamerpic_browser_dialog_.reset();
     }
     emulator_->kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
   }
@@ -1724,6 +1862,144 @@ void EmulatorWindow::ToggleContentListDialog() {
   }
 }
 
+void EmulatorWindow::ToggleFriendsDialog() {
+  if (!friends_manager_dialog_) {
+    disable_hotkeys_ = true;
+
+    if (emulator_->kernel_state()->xam_state()->IsUIActive()) {
+      return;
+    }
+
+    emulator_->kernel_state()->BroadcastNotification(kXNotificationSystemUI,
+                                                     true);
+    emulator_->kernel_state()->xam_state()->is_xam_dialog_present_.store(true);
+
+    friends_manager_dialog_ =
+        std::make_unique<ManagerDialog>(imgui_drawer_.get(), this);
+  } else {
+    disable_hotkeys_ = false;
+    emulator_->kernel_state()->BroadcastNotification(kXNotificationSystemUI,
+                                                     false);
+    if (friends_manager_dialog_->IsClosing()) {
+      friends_manager_dialog_.release();
+    } else {
+      friends_manager_dialog_.reset();
+    }
+    emulator_->kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
+  }
+}
+
+void EmulatorWindow::ToggleUpdaterDialog() {
+  if (!updater_dialog_) {
+    const bool auto_check_update =
+        update_info_.valid() ? update_info_.get().update_available : false;
+
+    disable_hotkeys_ = true;
+
+    if (emulator_->kernel_state()->xam_state()->IsUIActive()) {
+      return;
+    }
+
+    emulator_->kernel_state()->BroadcastNotification(kXNotificationSystemUI,
+                                                     true);
+    emulator_->kernel_state()->xam_state()->is_xam_dialog_present_.store(true);
+
+    updater_dialog_ = std::make_unique<UpdaterDialog>(
+        updater_, auto_check_update, imgui_drawer_.get(), this);
+  } else {
+    disable_hotkeys_ = false;
+    emulator_->kernel_state()->BroadcastNotification(kXNotificationSystemUI,
+                                                     false);
+    if (updater_dialog_->IsClosing()) {
+      updater_dialog_.release();
+    } else {
+      updater_dialog_.reset();
+    }
+    emulator_->kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
+  }
+}
+
+void EmulatorWindow::ToggleCompletionDialog() {
+  if (!updater_completion_dialog_) {
+    disable_hotkeys_ = true;
+
+    if (emulator_->kernel_state()->xam_state()->IsUIActive()) {
+      return;
+    }
+
+    emulator_->kernel_state()->BroadcastNotification(kXNotificationSystemUI,
+                                                     true);
+    emulator_->kernel_state()->xam_state()->is_xam_dialog_present_.store(true);
+
+    updater_completion_dialog_ = std::make_unique<UpdaterCompletionDialog>(
+        imgui_drawer_.get(), this, cvar::updated);
+  } else {
+    disable_hotkeys_ = false;
+    emulator_->kernel_state()->BroadcastNotification(kXNotificationSystemUI,
+                                                     false);
+    if (updater_completion_dialog_->IsClosing()) {
+      updater_completion_dialog_.release();
+    } else {
+      updater_completion_dialog_.reset();
+    }
+    emulator_->kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
+  }
+}
+
+void EmulatorWindow::ToggleNetplaySettingsDialog() {
+  if (!netplay_settings_dialog_) {
+    disable_hotkeys_ = true;
+
+    if (emulator_->kernel_state()->xam_state()->IsUIActive()) {
+      return;
+    }
+
+    emulator_->kernel_state()->BroadcastNotification(kXNotificationSystemUI,
+                                                     true);
+    emulator_->kernel_state()->xam_state()->is_xam_dialog_present_.store(true);
+
+    netplay_settings_dialog_ = std::make_unique<NetplaySettingsDialog>(
+        imgui_drawer_.get(), this, emulator_->GetNetworkAdapterManager());
+  } else {
+    disable_hotkeys_ = false;
+    emulator_->kernel_state()->BroadcastNotification(kXNotificationSystemUI,
+                                                     false);
+    if (netplay_settings_dialog_->IsClosing()) {
+      netplay_settings_dialog_.release();
+    } else {
+      netplay_settings_dialog_.reset();
+    }
+    emulator_->kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
+  }
+}
+
+void EmulatorWindow::ToggleNetplayStatusDialog() {
+  if (!netplay_status_dialog_) {
+    disable_hotkeys_ = true;
+
+    if (emulator_->kernel_state()->xam_state()->IsUIActive()) {
+      return;
+    }
+
+    emulator_->kernel_state()->BroadcastNotification(kXNotificationSystemUI,
+                                                     true);
+    emulator_->kernel_state()->xam_state()->is_xam_dialog_present_.store(true);
+
+    netplay_status_dialog_ = std::make_unique<NetplayStatusDialog>(
+        imgui_drawer_.get(), this, emulator_->GetNetworkAdapterManager());
+  } else {
+    disable_hotkeys_ = false;
+    emulator_->kernel_state()->BroadcastNotification(kXNotificationSystemUI,
+                                                     false);
+    if (netplay_status_dialog_->IsClosing()) {
+      netplay_status_dialog_.release();
+    } else {
+      netplay_status_dialog_.reset();
+    }
+    emulator_->kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
+  }
+}
+
 void EmulatorWindow::ToggleControllerVibration() {
   auto input_sys = emulator()->input_system();
   if (input_sys) {
@@ -1760,10 +2036,10 @@ void EmulatorWindow::ShowFAQ() {
 void EmulatorWindow::ShowBuildCommit() {
 #ifdef XE_BUILD_IS_PR
   LaunchWebBrowser(
-      "https://github.com/xenia-canary/xenia-canary/pull/" XE_BUILD_PR_NUMBER);
+      "https://github.com/AdrianCassar/xenia-canary/pull/" XE_BUILD_PR_NUMBER);
 #else
   LaunchWebBrowser(
-      "https://github.com/xenia-canary/xenia-canary/commit/" XE_BUILD_COMMIT);
+      "https://github.com/AdrianCassar/xenia-canary/commit/" XE_BUILD_COMMIT);
 #endif
 }
 
@@ -2470,6 +2746,30 @@ void EmulatorWindow::ClearDialogs() {
 
   if (xmp_config_dialog_) {
     xmp_config_dialog_.reset();
+  }
+
+  if (friends_manager_dialog_) {
+    friends_manager_dialog_.reset();
+  }
+
+  if (gamerpic_browser_dialog_) {
+    gamerpic_browser_dialog_.reset();
+  }
+
+  if (updater_dialog_) {
+    updater_dialog_.reset();
+  }
+
+  if (updater_completion_dialog_) {
+    updater_completion_dialog_.reset();
+  }
+
+  if (netplay_settings_dialog_) {
+    netplay_settings_dialog_.reset();
+  }
+
+  if (netplay_status_dialog_) {
+    netplay_status_dialog_.reset();
   }
 
   imgui_drawer_.get()->ClearDialogs();

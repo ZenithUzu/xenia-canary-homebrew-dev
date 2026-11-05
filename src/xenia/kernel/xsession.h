@@ -10,6 +10,13 @@
 #ifndef XENIA_KERNEL_XSESSION_H_
 #define XENIA_KERNEL_XSESSION_H_
 
+#include "xenia/base/byte_order.h"
+#include "xenia/kernel/json/session_object_json.h"
+#include "xenia/kernel/util/xlast.h"
+#include "xenia/kernel/xam/user_property.h"
+#include "xenia/kernel/xnet.h"
+#include "xenia/kernel/xobject.h"
+
 namespace xe {
 namespace kernel {
 
@@ -25,7 +32,10 @@ enum SessionFlags {
   JOIN_VIA_PRESENCE_DISABLED = 0x0200,
   JOIN_IN_PROGRESS_DISABLED = 0x0400,
   JOIN_VIA_PRESENCE_FRIENDS_ONLY = 0x0800,
-  UNKNOWN = 0x1000,  // 4156091D and 5841128F sets this flag?
+  // Set by 584113DB, 4156091D and 5841128F.
+  // When flushing stats of a STATS | ARBITRATION session, it skips
+  // the stats write and only posts the XArb ReportResult.
+  UNKNOWN = 0x1000,
 
   SINGLEPLAYER_WITH_STATS = PRESENCE | STATS | INVITES_DISABLED |
                             JOIN_VIA_PRESENCE_DISABLED |
@@ -47,6 +57,223 @@ inline bool IsOfflineSession(const SessionFlags flags) { return !flags; }
 inline bool IsXboxLiveSession(const SessionFlags flags) {
   return !IsOfflineSession(flags) && flags & SessionFlags::LIVE_FEATURES;
 }
+
+inline bool IsSystemlinkSession(const SessionFlags flags) {
+  return !IsOfflineSession(flags) && !IsXboxLiveSession(flags) &&
+         flags & SessionFlags::SYSTEMLINK_FEATURES;
+}
+
+struct Player {
+  xe::be<uint64_t> xuid;
+  std::string hostAddress;
+  xe::be<uint64_t> machineId;
+  uint16_t port;
+  xe::be<uint64_t> macAddress;  // 6 Bytes
+  xe::be<uint64_t> sessionId;
+};
+
+struct SessionJSON {
+  xe::be<uint64_t> sessionid;
+  xe::be<uint16_t> port;
+  xe::be<uint32_t> flags;
+  std::string hostAddress;
+  std::string macAddress;
+  xe::be<uint32_t> publicSlotsCount;
+  xe::be<uint32_t> privateSlotsCount;
+  xe::be<uint32_t> openPublicSlotsCount;
+  xe::be<uint32_t> openPrivateSlotsCount;
+  xe::be<uint32_t> filledPublicSlotsCount;
+  xe::be<uint32_t> filledPrivateSlotsCount;
+  std::vector<Player> players;
+};
+
+struct MachineInfo {
+  xe::be<uint64_t> machineId;
+  xe::be<uint32_t> playerCount;
+  std::vector<uint64_t> xuids;
+};
+
+struct XSessionArbitrationJSON {
+  xe::be<uint32_t> totalPlayers;
+  std::vector<MachineInfo> machines;
+};
+
+class XSession : public XObject {
+ public:
+  static const Type kObjectType = Type::Session;
+
+  XSession(KernelState* kernel_state);
+
+  X_STATUS Initialize();
+  X_RESULT CreateSession(uint32_t user_index, uint8_t public_slots,
+                         uint8_t private_slots, uint32_t flags,
+                         uint32_t session_info_ptr, uint32_t nonce_ptr);
+  X_RESULT DeleteSession(XGI_SESSION_STATE* state);
+
+  X_RESULT JoinSession(XGI_SESSION_MANAGE* data);
+  X_RESULT LeaveSession(XGI_SESSION_MANAGE* data);
+
+  X_RESULT ModifySession(XGI_SESSION_MODIFY* data);
+  X_RESULT GetSessionDetails(XGI_SESSION_DETAILS* data);
+  X_RESULT MigrateHost(XGI_SESSION_MIGRATE* data);
+  X_RESULT RegisterArbitration(XGI_SESSION_ARBITRATION* data);
+  X_RESULT ModifySkill(XGI_SESSION_MODIFYSKILL* data);
+  X_RESULT WriteStats(XGI_STATS_WRITE* data);
+  X_RESULT FlushStats();
+  bool ShouldReportStats() const;
+
+  X_RESULT StartSession(XGI_SESSION_STATE* state);
+  X_RESULT EndSession(XGI_SESSION_STATE* state);
+
+  static X_RESULT GetSessions(KernelState* kernel_state,
+                              XGI_SESSION_SEARCH* search_data,
+                              uint32_t num_users);
+  static X_RESULT GetWeightedSessions(KernelState* kernel_state,
+                                      XGI_SESSION_SEARCH_WEIGHTED* search_data,
+                                      uint32_t num_users);
+  static X_RESULT GetSessionByID(KernelState* kernel_state,
+                                 XGI_SESSION_SEARCH_BYID* search_data);
+  static X_RESULT GetSessionByIDs(KernelState* kernel_state,
+                                  XGI_SESSION_SEARCH_BYIDS* search_data);
+  static X_RESULT GetSessionByIDs(KernelState* kernel_state,
+                                  XNKID* session_ids_ptr,
+                                  uint32_t num_session_ids,
+                                  uint32_t search_results_ptr,
+                                  uint32_t results_buffer_size);
+
+  bool IsOfflineSession() const {
+    return kernel::IsOfflineSession(
+        static_cast<SessionFlags>(local_details_.Flags.get()));
+  }
+
+  bool IsXboxLiveSession() {
+    return kernel::IsXboxLiveSession(
+        static_cast<SessionFlags>(local_details_.Flags.get()));
+  }
+
+  inline bool IsSystemlinkSession() {
+    return kernel::IsSystemlinkSession(
+        static_cast<SessionFlags>(local_details_.Flags.get()));
+  }
+
+  static bool HasUsesFlags(uint32_t flags) {
+    return flags & X_SESSION_CREATE_USES_MASK;
+  }
+
+  static bool HasModifersFlags(uint32_t flags) {
+    return flags & X_SESSION_CREATE_MODIFIERS_MASK;
+  }
+
+  const uint32_t GetMembersCount() const {
+    const uint32_t max_slots =
+        local_details_.MaxPrivateSlots + local_details_.MaxPublicSlots;
+
+    const uint32_t available_slots = local_details_.AvailablePrivateSlots +
+                                     local_details_.AvailablePublicSlots;
+
+    // When adding a member we can calculate the next slot
+    const uint32_t used_slot = max_slots - available_slots;
+
+    const uint32_t members_size = static_cast<uint32_t>(local_members_.size()) +
+                                  static_cast<uint32_t>(remote_members_.size());
+
+    assert_false(used_slot != members_size);
+
+    return members_size;
+  }
+
+  const bool IsCreated() const {
+    return (state_ & STATE_FLAGS_CREATED) == STATE_FLAGS_CREATED;
+  }
+
+  const bool IsHost() const {
+    return (state_ & STATE_FLAGS_HOST) == STATE_FLAGS_HOST;
+  }
+
+  const bool IsMigrted() const {
+    return (state_ & STATE_FLAGS_MIGRATED) == STATE_FLAGS_MIGRATED;
+  }
+
+  const bool IsDeleted() const {
+    return (state_ & STATE_FLAGS_DELETED) == STATE_FLAGS_DELETED;
+  }
+
+  bool IsPresenceEnabled() const;
+
+  bool IsJoinViaPresenceEnabled() const;
+
+  bool IsJoinViaPresenceFriendsOnly() const;
+
+  bool IsJoinInProgressEnabled() const;
+
+  bool IsInvitesEnabled() const;
+
+  bool IsSessionStarted() const;
+
+  bool IsSessionEnded() const;
+
+  uint64_t GetSessionID() const { return session_id_; };
+
+  uint32_t GetTotalMaxSlots() const {
+    return local_details_.MaxPublicSlots + local_details_.MaxPrivateSlots;
+  }
+
+  XSESSION_INFO GetSessionInfo() const { return local_details_.sessionInfo; };
+
+  XSESSION_LOCAL_DETAILS GetSessionDetails() const { return local_details_; };
+
+  // Gets XUID of the owner managing the local session
+  uint64_t GetOwnerXUID() const { return owner_xuid_; };
+
+  // Cache latest properties sent to backend
+  void CacheLiveProperties(std::vector<xam::Property> properties) {
+    live_properties_ = properties;
+  };
+
+  std::vector<xam::Property> GetCachedLiveProperties() {
+    return live_properties_;
+  };
+
+ private:
+  void PrintSessionDetails();
+  void PrintSessionType(SessionFlags flags);
+
+  X_RESULT CreateHostSession(XSESSION_INFO* session_info,
+                             xe::be<uint64_t>* nonce_ptr, uint8_t user_index,
+                             uint8_t public_slots, uint8_t private_slots,
+                             uint32_t flags);
+  X_RESULT CreateStatsSession(XSESSION_INFO* session_info,
+                              xe::be<uint64_t>* nonce_ptr, uint8_t user_index,
+                              uint8_t public_slots, uint8_t private_slots,
+                              uint32_t flags);
+  X_RESULT JoinExistingSession(XSESSION_INFO* session_info);
+
+  const bool HasSessionFlag(SessionFlags flags,
+                            SessionFlags checked_flag) const {
+    return (flags & checked_flag) == checked_flag;
+  };
+
+  static void FillSessionSearchResult(const SessionObjectJSON session_info,
+                                      XSESSION_SEARCHRESULT* result);
+
+  void NotifySessionCreationWarning(uint32_t user_index) const;
+
+  uint64_t owner_xuid_;
+
+  std::vector<xam::Property> live_properties_;
+
+  // uint64_t migrated_session_id_;
+  uint64_t session_id_ = 0;
+  uint32_t state_ = 0;
+
+  XSESSION_LOCAL_DETAILS local_details_{};
+
+  std::map<uint64_t, XSESSION_MEMBER> local_members_{};
+  std::map<uint64_t, XSESSION_MEMBER> remote_members_{};
+
+  // Cached stats
+  view_properties_unordered_map cached_stats_properties_ = {};
+};
 
 }  // namespace kernel
 }  // namespace xe

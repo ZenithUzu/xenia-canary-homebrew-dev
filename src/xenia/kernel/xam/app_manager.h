@@ -32,15 +32,17 @@ class App {
  public:
   uint32_t app_id() const { return app_id_; }
 
-  virtual X_HRESULT DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
-                                        uint32_t buffer_length) = 0;
+  virtual X_HRESULT ExecuteDispatchMessage(uint32_t message,
+                                           uint32_t buffer_ptr,
+                                           uint32_t buffer_length,
+                                           uint32_t* extended_error) = 0;
 
   virtual ~App() = default;
+  KernelState* kernel_state_;
 
  protected:
   App(KernelState* kernel_state, uint32_t app_id);
 
-  KernelState* kernel_state_;
   Memory* memory_;
   uint32_t app_id_;
 };
@@ -51,10 +53,13 @@ class AppManager {
 
   void RegisterApp(std::unique_ptr<App> app);
 
+  bool HasApp(uint32_t app_id) const { return app_lookup_.contains(app_id); }
+
   X_HRESULT DispatchMessageSync(uint32_t app_id, uint32_t message,
                                 uint32_t buffer_ptr, uint32_t buffer_length);
   X_HRESULT DispatchMessageAsync(uint32_t app_id, uint32_t message,
-                                 uint32_t buffer_ptr, uint32_t buffer_length);
+                                 uint32_t buffer_ptr, uint32_t buffer_length,
+                                 uint32_t overlapped_ptr);
 
  private:
   std::vector<std::unique_ptr<App>> apps_;

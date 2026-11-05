@@ -19,6 +19,7 @@
 #include "xenia/base/bit_map.h"
 #include "xenia/cpu/backend/backend.h"
 #include "xenia/cpu/export_resolver.h"
+#include "xenia/kernel/XLiveAPI.h"
 #include "xenia/kernel/kernel.h"
 #include "xenia/kernel/nui.h"
 #include "xenia/kernel/smc.h"
@@ -29,6 +30,7 @@
 #include "xenia/kernel/xam/achievement_manager.h"
 #include "xenia/kernel/xam/app_manager.h"
 #include "xenia/kernel/xam/content_manager.h"
+#include "xenia/kernel/xam/friends_manager.h"
 #include "xenia/kernel/xam/user_profile.h"
 #include "xenia/kernel/xam/xam_state.h"
 #include "xenia/kernel/xam/xdbf/spa_info.h"
@@ -165,6 +167,16 @@ struct KernelVersion {
     build = std::max(kBaseKernelBuildVersion, build_ver);
     qfe = 0;
   }
+
+  // Packed as major:4 minor:4 build:16 qfe:8, e.g. 2.0.17559.0 = 0x20449700
+  uint32_t GetPackedVersion() const {
+    const uint32_t major_ver = major.get();
+    const uint32_t minor_ver = minor.get();
+    const uint32_t build_ver = build.get();
+    const uint32_t qfe_ver = qfe.get();
+    return ((major_ver & 0xF) << 28) | ((minor_ver & 0xF) << 24) |
+           (build_ver << 8) | (qfe_ver & 0xFF);
+  }
 };
 
 class KernelState {
@@ -182,6 +194,8 @@ class KernelState {
   xex2_opt_execution_info* GetExecutionInfo() const;
   uint32_t title_id() const;
   bool is_title_open() const;
+  static bool is_title_system_type(uint32_t title_id);
+  XNKEY* title_lan_key() const;
   const std::unique_ptr<xam::SpaInfo> title_xdbf() const;
   const std::unique_ptr<xam::SpaInfo> module_xdbf(
       object_ref<UserModule> exec_module) const;
@@ -199,11 +213,19 @@ class KernelState {
   xam::ContentManager* content_manager() const {
     return xam_state()->content_manager();
   }
+  xam::FriendsManager* friends_manager() const {
+    return xam_state()->friends_manager();
+  }
+  xam::PresenceManager* presence_manager() const {
+    return xam_state()->presence_manager();
+  }
 
   XmpVolumePatch* xmp_volume_patch() const { return xmp_volume_patch_.get(); }
   void InitXmpVolumePatch();
 
   XConfig* xconfig() const { return xconfig_.get(); }
+
+  XLiveAPI* GetXboxLiveAPI() const;
 
   std::bitset<4> GetConnectedUsers() const;
 
@@ -310,6 +332,8 @@ class KernelState {
       uint32_t overlapped_ptr, std::function<void()> pre_callback = nullptr,
       std::function<void()> post_callback = nullptr);
 
+  bool CancelOverlapped(uint32_t overlapped_ptr, bool wait);
+
   bool Save(ByteStream* stream);
   bool Restore(ByteStream* stream);
 
@@ -394,6 +418,20 @@ class KernelState {
   util::NativeList dpc_list_;
   std::condition_variable_any dispatch_cond_;
   std::list<std::function<void()>> dispatch_queue_;
+
+  struct DeferredOverlappedRequest {
+    uint64_t id;
+    bool running;
+    bool cancelled;
+  };
+
+  void SetOverlappedCompletion(uint32_t overlapped_ptr, X_RESULT result,
+                               uint32_t extended_error, uint32_t length);
+
+  std::unordered_map<uint32_t, DeferredOverlappedRequest>
+      deferred_overlapped_requests_;
+  uint64_t next_deferred_overlapped_request_id_ = 0;
+  std::condition_variable_any deferred_overlapped_cond_;
 
   uint32_t ke_timestamp_bundle_ptr_ = 0;
   std::unique_ptr<xe::threading::HighResolutionTimer> timestamp_timer_;

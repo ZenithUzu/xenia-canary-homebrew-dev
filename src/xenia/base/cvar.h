@@ -317,6 +317,9 @@ void ConfigVar<T>::ResetConfigValueToDefault() {
 extern std::map<std::string, ICommandVar*>* CmdVars;
 extern std::map<std::string, IConfigVar*>* ConfigVars;
 
+extern bool updated;
+extern bool updated_arg_present;
+
 inline void AddConfigVar(IConfigVar* cv) {
   if (!ConfigVars) {
     ConfigVars = new std::map<std::string, IConfigVar*>;
@@ -519,7 +522,7 @@ class IConfigVarUpdate {
   // If you're reviewing a pull request with a change here, check if 1) has been
   // done by the submitter before merging.
   static constexpr uint32_t kLastCommittedUpdateDate =
-      MakeConfigVarUpdateDate(2026, 4, 9, 12);
+      MakeConfigVarUpdateDate(2026, 10, 20, 12);
 
   virtual ~IConfigVarUpdate() = default;
 

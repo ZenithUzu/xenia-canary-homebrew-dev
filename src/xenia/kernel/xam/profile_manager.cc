@@ -15,7 +15,9 @@
 #include "xenia/base/logging.h"
 #include "xenia/emulator.h"
 #include "xenia/hid/input_system.h"
+#include "xenia/kernel/XLiveAPI.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/util/friends_util.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_crypt.h"
 #include "xenia/vfs/devices/host_path_device.h"
 
@@ -149,8 +151,12 @@ void ProfileManager::ReloadProfiles() {
   }
 }
 
-UserProfile* ProfileManager::GetProfileLive(const uint64_t xuid) const {
-  uint8_t user_index = GetUserIndexAssignedToLiveProfile(xuid);
+UserProfile* ProfileManager::GetProfileAny(const uint64_t xuid) const {
+  return GetProfile(xuid) ? GetProfile(xuid) : GetProfileLive(xuid);
+}
+
+UserProfile* ProfileManager::GetProfile(const uint64_t xuid) const {
+  uint8_t user_index = GetUserIndexAssignedToProfile(xuid);
 
   if (user_index >= XUserMaxUserCount) {
     return nullptr;
@@ -159,8 +165,9 @@ UserProfile* ProfileManager::GetProfileLive(const uint64_t xuid) const {
   return GetProfile(user_index);
 }
 
-UserProfile* ProfileManager::GetProfile(const uint64_t xuid) const {
-  const uint8_t user_index = GetUserIndexAssignedToProfile(xuid);
+UserProfile* ProfileManager::GetProfileLive(const uint64_t xuid) const {
+  uint8_t user_index = GetUserIndexAssignedToLiveProfile(xuid);
+
   if (user_index >= XUserMaxUserCount) {
     return nullptr;
   }
@@ -365,6 +372,18 @@ void ProfileManager::Login(const uint64_t xuid, const uint8_t user_index,
                                          GetUsedUserSlots().to_ulong());
   }
   UpdateConfig(xuid, assigned_user_slot);
+
+  if (kernel_state_->GetXboxLiveAPI()->IsConnectedToServer()) {
+    // TODO(Adrian):
+    // Netplay doesn't support multiple local profiles too well.
+    // Only register user index 0 on backend for now to reduce issues.
+    if (assigned_user_slot == 0) {
+      std::unique_ptr<HTTPResponseObjectJSON> reg_result =
+          kernel_state_->GetXboxLiveAPI()->RegisterPlayer(xuid);
+    }
+  }
+
+  logged_profiles_[assigned_user_slot]->LoadFriends();
 }
 
 void ProfileManager::Logout(const uint8_t user_index, bool notify) {
@@ -373,6 +392,8 @@ void ProfileManager::Logout(const uint8_t user_index, bool notify) {
     return;
   }
 
+  user_tracker_->StopPeriodicMaintenance(profile->second->xuid());
+  user_tracker_->CleanupOwnedSessions(profile->second->xuid());
   kernel_state_->xam_state()->user_tracker()->RemoveUser(
       profile->second->xuid());
   DismountProfile(profile->second->xuid());
@@ -382,6 +403,16 @@ void ProfileManager::Logout(const uint8_t user_index, bool notify) {
                                          GetUsedUserSlots().to_ulong());
   }
   UpdateConfig(0, user_index);
+}
+
+void ProfileManager::LogoutMultiple(
+    const std::map<uint8_t, uint64_t>& profiles) {
+  for (auto& [slot, xuid] : profiles) {
+    Logout(slot, false);
+  }
+
+  kernel_state_->BroadcastNotification(kXNotificationSystemSignInChanged,
+                                       GetUsedUserSlots().to_ulong());
 }
 
 void ProfileManager::LoginMultiple(
@@ -523,8 +554,10 @@ std::filesystem::path ProfileManager::GetProfilePath(
 }
 
 bool ProfileManager::CreateProfile(const std::string gamertag, bool autologin,
-                                   bool default_xuid) {
+                                   bool default_xuid, uint32_t reserved_flags,
+                                   uint64_t* out_xuid) {
   const auto xuid = !default_xuid ? GenerateXuid() : 0xB13EBABEBABEBABE;
+
   const auto profile_path = GetProfilePath(xuid);
   if (!std::filesystem::create_directories(profile_path)) {
     return false;
@@ -541,11 +574,16 @@ bool ProfileManager::CreateProfile(const std::string gamertag, bool autologin,
     return false;
   }
 
-  const bool is_account_created = CreateAccount(xuid, gamertag);
+  const bool is_account_created = CreateAccount(xuid, gamertag, reserved_flags);
   if (is_account_created && autologin) {
     Login(xuid);
   }
-  return is_account_created;
+
+  if (out_xuid) {
+    *out_xuid = xuid;
+  }
+
+  return true;
 }
 
 bool ProfileManager::CreateProfile(const X_XAMACCOUNTINFO* account_info,
@@ -581,12 +619,23 @@ const X_XAMACCOUNTINFO* ProfileManager::GetAccount(const uint64_t xuid) {
 }
 
 bool ProfileManager::CreateAccount(const uint64_t xuid,
-                                   const std::string gamertag) {
+                                   const std::string gamertag,
+                                   uint32_t reserved_flags) {
   X_XAMACCOUNTINFO account = {};
   const std::u16string gamertag_u16 = xe::to_utf16(gamertag);
 
   string_util::copy_and_swap_truncating(account.gamertag, gamertag_u16,
                                         xe::countof(account.gamertag));
+
+  const bool live_enabled =
+      reserved_flags & X_XAMACCOUNTINFO::AccountReservedFlags::kLiveEnabled;
+
+  account.reserved_flags = reserved_flags;
+
+  if (live_enabled) {
+    SetDefaultXboxLiveEnabledAccountSettings(account);
+    account.xuid_online = GenerateXuidOnline();
+  }
 
   const bool result = UpdateAccount(xuid, &account);
   DismountProfile(xuid);
@@ -604,6 +653,28 @@ bool ProfileManager::CreateAccount(const uint64_t xuid,
     accounts_.insert({xuid, *account});
   }
   return result;
+}
+
+void ProfileManager::SetDefaultXboxLiveEnabledAccountSettings(
+    X_XAMACCOUNTINFO& account) const {
+  const XOnlineCountry country_id = static_cast<XOnlineCountry>(
+      kernel_state_->xconfig()->ReadSetting<uint8_t>(XCONFIG_USER_CATEGORY,
+                                                     XCONFIG_USER_COUNTRY));
+
+  const XLanguage desired_language =
+      static_cast<XLanguage>(kernel_state_->xconfig()->ReadSetting<uint32_t>(
+          XCONFIG_USER_CATEGORY,
+          XCONFIG_USER_CATEGORY_ENTRIES::XCONFIG_USER_LANGUAGE));
+
+  account.ToggleLiveFlag(true);
+
+  account.SetCountry(country_id);
+  account.SetLanguage(desired_language);
+
+  account.SetSubscriptionTier(
+      X_XAMACCOUNTINFO::AccountSubscriptionTier::kSubscriptionTierGold);
+
+  account.SetXboxLiveServiceProvider(X_XAMACCOUNTINFO::ProductionNet);
 }
 
 bool ProfileManager::UpdateAccount(const uint64_t xuid,
@@ -683,6 +754,76 @@ bool ProfileManager::DeleteProfile(const uint64_t xuid) {
     return false;
   }
   return true;
+}
+
+bool ProfileManager::ModifyAccount(
+    const uint64_t xuid, X_XAMACCOUNTINFO& account,
+    std::function<bool(X_XAMACCOUNTINFO& account)> action) {
+  const uint8_t user_index = GetUserIndexAssignedToProfile(xuid);
+
+  if (user_index < XUserMaxUserCount) {
+    Logout(user_index);
+  }
+
+  if (!accounts_.count(xuid)) {
+    return false;
+  }
+
+  auto result = action(account);
+
+  if (!MountProfile(xuid)) {
+    return false;
+  }
+
+  if (!UpdateAccount(xuid, &account)) {
+    return false;
+  }
+
+  if (!DismountProfile(xuid)) {
+    return false;
+  }
+
+  if (user_index < XUserMaxUserCount) {
+    Login(xuid);
+  }
+
+  return true;
+}
+
+bool ProfileManager::ConvertToXboxLiveEnabledProfile(const uint64_t xuid) {
+  X_XAMACCOUNTINFO& account = accounts_[xuid];
+
+  // We want to apply settings to profiles that were created without default
+  // settings initially.
+  user_tracker_->SetupDefaultProfileSettings(xuid);
+
+  auto run = [this](X_XAMACCOUNTINFO& account_info) {
+    SetDefaultXboxLiveEnabledAccountSettings(account_info);
+
+    // Set default settings and online XUID once
+    if (!account_info.xuid_online) {
+      account_info.xuid_online = GenerateXuidOnline();
+    }
+
+    return true;
+  };
+
+  return ModifyAccount(xuid, account, run);
+}
+
+bool ProfileManager::ConvertToOfflineProfile(const uint64_t xuid) {
+  X_XAMACCOUNTINFO& account = accounts_[xuid];
+
+  auto run = [](X_XAMACCOUNTINFO& account_info) {
+    account_info.ToggleLiveFlag(false);
+    account_info.SetSubscriptionTier(
+        X_XAMACCOUNTINFO::AccountSubscriptionTier::kSubscriptionTierNone);
+    account_info.SetXboxLiveServiceProvider(X_XAMACCOUNTINFO::LiveDisabled);
+
+    return true;
+  };
+
+  return ModifyAccount(xuid, account, run);
 }
 
 bool ProfileManager::IsGamertagValid(const std::string gamertag) {

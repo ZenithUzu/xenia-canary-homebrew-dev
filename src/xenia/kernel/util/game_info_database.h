@@ -153,6 +153,9 @@ class GameInfoDatabase {
   Field GetField(const xam::ViewFieldEntry& field_entry) const;
   std::optional<GameInfoDatabase::StatsView> GetStatsView(
       const uint32_t id) const;
+  std::optional<GameInfoDatabase::Field> GetStatsViewColumn(
+      uint32_t view_id, uint32_t column_id) const;
+  std::string GetStatsViewResetType(const uint32_t view_id) const;
   Presence GetPresence() const;
   std::optional<GameInfoDatabase::PresenceMode> GetPresenceMode(
       const uint32_t context_value) const;
@@ -174,6 +177,9 @@ class GameInfoDatabase {
   std::vector<Achievement> GetAchievements() const;
   std::vector<PresenceMode> GetPresenceModes() const;
   std::vector<StatsView> GetStatsViews() const;
+
+  const bool HasXLast() const { return xlast_gamedata_.get(); };
+  XLast* GetXLast() const { return xlast_gamedata_.get(); };
 
  private:
   void Init(const xam::SpaInfo* data);

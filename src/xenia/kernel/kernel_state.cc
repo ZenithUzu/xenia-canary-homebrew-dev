@@ -35,15 +35,16 @@ DEFINE_bool(allow_incompatible_title_update, false,
             "Allow title updates with mismatched signatures to be applied.",
             "Kernel");
 
-DEFINE_uint32(kernel_build_version, 1888, "Define current kernel version",
+DEFINE_uint32(kernel_build_version, 17559, "Define current kernel version",
               "Kernel");
+UPDATE_from_any(kernel_build_version, 2026, 10, 20, 12);
 
 DECLARE_string(cl);
 
+DECLARE_int32(network_mode);
+
 namespace xe {
 namespace kernel {
-
-constexpr std::chrono::milliseconds kDeferredOverlappedDelayMillis(25);
 
 // This is a global object initialized with the XboxkrnlModule.
 // It references the current kernel state object that all kernel methods should
@@ -146,6 +147,33 @@ uint32_t KernelState::title_id() const {
 }
 
 bool KernelState::is_title_open() const { return emulator_->is_title_open(); }
+
+XLiveAPI* KernelState::GetXboxLiveAPI() const {
+  return emulator()->GetXboxLiveAPI();
+}
+
+bool KernelState::is_title_system_type(uint32_t title_id) {
+  if (!title_id) {
+    return true;
+  }
+
+  if ((title_id & 0xFF000000) == 0x58000000u) {
+    return (title_id & 0xFF0000) != 0x410000;  // if 'X' but not 'XA' (XBLA)
+  }
+
+  return (title_id >> 16) == 0xFFFE;
+}
+
+XNKEY* KernelState::title_lan_key() const {
+  if (!executable_module_) {
+    return nullptr;
+  }
+
+  xex2_opt_lan_key* opt_lan_key_ptr = 0;
+  executable_module_->GetOptHeader(XEX_HEADER_LAN_KEY, &opt_lan_key_ptr);
+
+  return reinterpret_cast<XNKEY*>(opt_lan_key_ptr->key);
+}
 
 const std::unique_ptr<xam::SpaInfo> KernelState::title_xdbf() const {
   return module_xdbf(executable_module_);
@@ -896,6 +924,7 @@ void KernelState::InitXmpVolumePatch() {
 
 void KernelState::TerminateTitle() {
   XELOGD("KernelState::TerminateTitle");
+  xam_state_->StopPeriodicMaintenance();
   xmp_volume_patch_.reset();
   auto global_lock = global_critical_region_.Acquire();
 
@@ -1071,13 +1100,29 @@ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
       listener->EnqueueNotification(kXNotificationSystemStorageDevicesChanged,
                                     0);
     }
+
+    const auto signed_in_players =
+        xam_state()->profile_manager()->GetUsedUserSlots().to_ulong();
+
+    listener->EnqueueNotification(kXNotificationSystemSignInChanged,
+                                  signed_in_players);
   }
+
   if (!has_notified_live_startup_ && listener->mask() & kXNotifyLive) {
     has_notified_live_startup_ = true;
-    // X_ONLINE_S_LOGON_DISCONNECTED
+
+    // Expects notification:
+    // 415707D1 fails to join sessions.
+    // 4E4D07D3 gets stuck in online menus.
+    const uint32_t live_connection_state =
+        xam_state()->user_tracker()->LoggedInToLive()
+            ? X_ONLINE_S_LOGON_CONNECTION_ESTABLISHED
+            : X_ONLINE_S_LOGON_DISCONNECTED;
+
     listener->EnqueueNotification(kXNotificationLiveConnectionChanged,
-                                  0x001510F1L);
-    listener->EnqueueNotification(kXNotificationLiveLinkStateChanged, 0);
+                                  live_connection_state);
+
+    listener->EnqueueNotification(kXNotificationLiveVoicechatAway, 0);
   }
 
   if (!has_notified_xmp_startup_ && listener->mask() & kXNotifyXmp) {
@@ -1087,6 +1132,17 @@ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
     listener->EnqueueNotification(
         kXNotificationXmpPlaybackControllerChanged,
         emulator()->audio_media_player()->IsTitleInPlaybackControl());
+  }
+
+  // 4E4D07ED, 58410869. Fixes creating Xbox Live sessions.
+  // 4D5307D4 expects multiple notifications to access Xbox Live menus.
+  // Sign in related
+  if (listener->mask() == (kXNotifySystem | kXNotifyLive)) {
+    const auto signed_in_players =
+        xam_state()->profile_manager()->GetUsedUserSlots().to_ulong();
+
+    listener->EnqueueNotification(kXNotificationSystemSignInChanged,
+                                  signed_in_players);
   }
 }
 
@@ -1115,6 +1171,24 @@ void KernelState::CompleteOverlapped(uint32_t overlapped_ptr, X_RESULT result) {
 void KernelState::CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
                                        uint32_t extended_error,
                                        uint32_t length) {
+  // If function failed then overwrite return error.
+  // What if a function expects a different return error?
+  if (result != X_ERROR_SUCCESS) {
+    result = X_ERROR_FUNCTION_FAILED;
+
+    // Function failed without setting extended_error.
+    if (extended_error == X_ERROR_SUCCESS) {
+      extended_error = X_E_FUNCTION_FAILED;
+    }
+  }
+
+  SetOverlappedCompletion(overlapped_ptr, result, extended_error, length);
+}
+
+void KernelState::SetOverlappedCompletion(uint32_t overlapped_ptr,
+                                          X_RESULT result,
+                                          uint32_t extended_error,
+                                          uint32_t length) {
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
   XOverlappedSetResult(ptr, result);
   XOverlappedSetExtendedError(ptr, extended_error);
@@ -1199,6 +1273,18 @@ void KernelState::CompleteOverlappedDeferredEx(
     uint32_t overlapped_ptr, std::function<void()> pre_callback,
     std::function<void()> post_callback) {
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
+
+  // Track the request before marking it pending so a stale completion cannot
+  // overwrite the pending state.
+  auto global_lock = global_critical_region_.Acquire();
+
+  // Supersedes any request still pending on this overlapped.
+  // 58410840 cancels XamEnumerate then reuses the overlapped for
+  // XUserReadStats, a stale XamEnumerate completion then signalled it before
+  // the results were written.
+  const uint64_t request_id = ++next_deferred_overlapped_request_id_;
+  deferred_overlapped_requests_[overlapped_ptr] = {request_id, false, false};
+
   XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);
   XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
   X_HANDLE event_handle = XOverlappedGetEvent(ptr);
@@ -1210,22 +1296,96 @@ void KernelState::CompleteOverlappedDeferredEx(
       ev.get<XEvent>()->Reset();
     }
   }
-  auto global_lock = global_critical_region_.Acquire();
+
   dispatch_queue_.push_back([this, completion_callback, overlapped_ptr,
-                             pre_callback, post_callback]() {
+                             request_id, pre_callback, post_callback]() {
     if (pre_callback) {
       pre_callback();
     }
-    // 5454082B infinitely loads free roam in netplay without sleep.
-    xe::threading::Sleep(kDeferredOverlappedDelayMillis);
-    uint32_t extended_error, length;
-    auto result = completion_callback(extended_error, length);
-    CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
+
+    {
+      auto global_lock = global_critical_region_.Acquire();
+
+      const auto it = deferred_overlapped_requests_.find(overlapped_ptr);
+
+      // Cancelled or superseded by a newer request on the same overlapped.
+      if (it == deferred_overlapped_requests_.end() ||
+          it->second.id != request_id) {
+        global_lock.unlock();
+
+        if (post_callback) {
+          post_callback();
+        }
+        return;
+      }
+
+      it->second.running = true;
+    }
+
+    uint32_t extended_error = 0;
+    uint32_t length = 0;
+    uint32_t result = completion_callback(extended_error, length);
+
+    {
+      auto global_lock = global_critical_region_.Acquire();
+
+      const auto it = deferred_overlapped_requests_.find(overlapped_ptr);
+
+      if (it != deferred_overlapped_requests_.end() &&
+          it->second.id == request_id) {
+        if (it->second.cancelled) {
+          SetOverlappedCompletion(overlapped_ptr, X_ERROR_CANCELLED,
+                                  X_HRESULT_FROM_WIN32(X_ERROR_CANCELLED), 0);
+        } else {
+          CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
+        }
+
+        deferred_overlapped_requests_.erase(it);
+      }
+
+      deferred_overlapped_cond_.notify_all();
+    }
+
     if (post_callback) {
       post_callback();
     }
   });
   dispatch_cond_.notify_all();
+}
+
+bool KernelState::CancelOverlapped(uint32_t overlapped_ptr, bool wait) {
+  auto global_lock = global_critical_region_.Acquire();
+
+  const auto it = deferred_overlapped_requests_.find(overlapped_ptr);
+
+  if (it == deferred_overlapped_requests_.end()) {
+    return false;
+  }
+
+  // Not started yet, drop it from the dispatch queue by completing it now.
+  if (!it->second.running) {
+    deferred_overlapped_requests_.erase(it);
+
+    SetOverlappedCompletion(overlapped_ptr, X_ERROR_CANCELLED,
+                            X_HRESULT_FROM_WIN32(X_ERROR_CANCELLED), 0);
+    return true;
+  }
+
+  // Already running, it completes as cancelled once finished.
+  it->second.cancelled = true;
+
+  if (wait) {
+    const uint64_t request_id = it->second.id;
+
+    deferred_overlapped_cond_.wait(global_lock, [&]() {
+      const auto current = deferred_overlapped_requests_.find(overlapped_ptr);
+
+      return current == deferred_overlapped_requests_.end() ||
+             current->second.id != request_id;
+    });
+  }
+
+  return true;
 }
 
 bool KernelState::Save(ByteStream* stream) {

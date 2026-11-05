@@ -1,0 +1,85 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2025 Xenia Canary. All rights reserved.                          *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ */
+
+#include "xenia/kernel/json/services_json.h"
+#include "xenia/base/string.h"
+#include "xenia/kernel/util/net_utils.h"
+
+namespace xe {
+namespace kernel {
+ServicesObjectJSON::ServicesObjectJSON()
+    : services_results_({}), query_search_results_({}) {}
+
+ServicesObjectJSON::~ServicesObjectJSON() {}
+
+bool ServicesObjectJSON::Deserialize(const rapidjson::Value& obj) {
+  if (!obj.IsObject()) {
+    return false;
+  }
+
+  if (!obj.HasMember("services") && !obj.HasMember("querysearch")) {
+    return false;
+  }
+
+  if (obj.HasMember("services") && obj["services"].IsArray()) {
+    for (const auto& service : obj["services"].GetArray()) {
+      X_ONLINE_SERVICE_INFO service_info = {};
+
+      if (service.HasMember("service_id")) {
+        const auto service_id_str =
+            std::string(service["service_id"].GetString());
+
+        if (!service_id_str.empty()) {
+          service_info.id =
+              string_util::from_string<uint32_t>(service_id_str, true);
+        }
+      }
+
+      if (service.HasMember("address")) {
+        service_info.ip = ip_to_in_addr(service["address"].GetString());
+      }
+
+      if (service.HasMember("port")) {
+        service_info.port = service["port"].GetInt();
+      }
+
+      services_results_.push_back(service_info);
+    }
+  }
+
+  if (obj.HasMember("querysearch") && obj["querysearch"].IsArray()) {
+    for (const auto& service : obj["querysearch"].GetArray()) {
+      QuerySearchResult result = {};
+
+      if (service.HasMember("address")) {
+        result.address.inaOnline =
+            ip_to_in_addr(service["address"].GetString());
+      }
+
+      if (service.HasMember("port")) {
+        result.address.wPortOnline = service["port"].GetInt();
+      }
+
+      if (service.HasMember("filter") && service["filter"].IsString()) {
+        result.filter = xe::to_utf16(service["filter"].GetString());
+      }
+
+      query_search_results_.push_back(result);
+    }
+  }
+
+  return true;
+}
+
+bool ServicesObjectJSON::Serialize(
+    rapidjson::PrettyWriter<rapidjson::StringBuffer>* writer) const {
+  return false;
+}
+}  // namespace kernel
+}  // namespace xe
