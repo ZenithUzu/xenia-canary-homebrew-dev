@@ -34,7 +34,7 @@ Para que el juego tenga una sesión iniciada, importa los perfiles de otra insta
 
 ## Compilar
 
-Este fork aún no publica versiones compiladas. En Windows necesitas Visual Studio 2022 o posterior con C++, CMake, Windows 11 SDK, Python 3 de 64 bits y Vulkan SDK. Los detalles están en [docs/building.md](docs/building.md).
+Cada cambio de código en `canary_experimental` se compila con GitHub Actions y se publica en [Releases](https://github.com/ZenithUzu/xenia-canary-homebrew-dev/releases) para Windows. Para compilarlo tú, en Windows necesitas Visual Studio 2022 o posterior con C++, CMake, Windows 11 SDK, Python 3 de 64 bits y Vulkan SDK. Los detalles están en [docs/building.md](docs/building.md).
 
 ```bash
 git submodule update --init --depth=1

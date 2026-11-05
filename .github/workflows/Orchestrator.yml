@@ -1,11 +1,7 @@
 name: Orchestrator
 
 on:
-  push:
-    paths-ignore:
-      - '*.md'
-      - 'docs/**'
-      - 'LICENSE'
+  # Pushes to this fork are built by Homebrew_release.yml.
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths-ignore:

@@ -74,7 +74,8 @@ def main():
         sys.exit("Falta el ejecutable: compila primero la configuracion Release.")
 
     commit = git("rev-parse", "HEAD")
-    cambios = git("status", "--porcelain")
+    # Compilar puede dejar archivos generados dentro de los submodulos.
+    cambios = git("status", "--porcelain", "--ignore-submodules=dirty")
     borrador = bool(cambios)
     nombre = f"xenia-canary-homebrew-dev-windows-{commit[:9]}" + ("-borrador" if borrador else "")
     carpeta = os.path.join(SALIDA, nombre)

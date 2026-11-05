@@ -86,3 +86,20 @@ jobs:
           name: xenia_canary_netplay_windows
           path: ${{ steps.prepare_artifacts.outputs.path }}
           if-no-files-found: error
+
+      - name: Create release package
+        run: |-
+          # The Vulkan installer is the only file this job leaves in the repository.
+          Remove-Item vulkan-sdk.exe -ErrorAction SilentlyContinue
+          python tools/live_sim/empaquetar_windows.py
+          if (Test-Path "build\release\*-borrador.zip") {
+            echo "::error:: The package was built from a modified tree."
+            exit 1
+          }
+
+      - name: Upload release package
+        uses: actions/upload-artifact@v7
+        with:
+          name: xenia_homebrew_release_windows
+          path: build/release/*.zip
+          if-no-files-found: error

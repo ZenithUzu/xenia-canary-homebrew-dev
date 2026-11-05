@@ -1,0 +1,65 @@
+name: Homebrew Release
+
+# Compiles Windows and publishes the package with its third-party licenses.
+# Linux stays out of the release because that build links wolfSSL (GPLv3).
+on:
+  push:
+    branches:
+      - canary_experimental
+    paths-ignore:
+      - '*.md'
+      - 'docs/**'
+      - 'LICENSE'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows:
+    name: Windows (x86-64)
+    uses: ./.github/workflows/Windows_x86.yml
+
+  release:
+    name: Publish release
+    needs: build-windows
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download package
+        uses: actions/download-artifact@v8
+        with:
+          name: xenia_homebrew_release_windows
+          path: release_assets
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+        run: |-
+          TAG="homebrew-${SHA::9}"
+          cat > release_notes.md <<EOF
+          Compilación automática para Windows x64 de \`$BRANCH\`, commit \`$SHA\`.
+
+          Abre \`xenia_canary_netplay.exe\`, o usa \`tools/live_sim/lanzar_juego.py\` con Python para probar con el simulador de red.
+
+          No incluye juegos ni perfiles. Las licencias de terceros están en \`THIRD_PARTY_LICENSES\`, y el código de esta versión en este commit.
+          EOF
+          sed -i 's/^          //' release_notes.md
+
+          if gh release view "$TAG" --repo "$REPO" --json tagName > /dev/null 2>&1; then
+            gh release upload "$TAG" release_assets/* --repo "$REPO" --clobber
+          else
+            gh release create "$TAG" release_assets/* \
+              --repo "$REPO" \
+              --target "$SHA" \
+              --title "Homebrew Dev ${SHA::9}" \
+              --notes-file release_notes.md \
+              --latest
+          fi
