@@ -51,7 +51,7 @@ Probado en una compilación Release para Windows:
 |---|---|
 | `net_probe`, incluida una petición HTTP real | 36 de 38 comprobaciones correctas; `XSessionStart` y `XSessionEnd` fallan porque la prueba no registra el arbitraje |
 | AdvanXe360 | Abre, crea `Roms` y conecta con GitHub por HTTPS; la descarga de portadas no se ha probado en este fork |
-| `sm64coopdx` | Crea `save`, abre la pantalla y dibuja su menú; pide la ROM, así que la partida y su red no se han probado |
+| `sm64coopdx` | Crea `save`, acepta la ROM y dibuja el juego en 3D durante unos 35 s sin mando; los controles, el sonido y la red no se han probado |
 | xDS360 | Abre la pantalla y presenta frames; pide `game.nds`, así que la emulación no se ha probado |
 
 ## Límites
