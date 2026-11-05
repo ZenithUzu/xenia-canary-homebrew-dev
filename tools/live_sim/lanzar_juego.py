@@ -31,7 +31,9 @@ LLAMADA = re.compile(r"Nt(?:CreateFile|OpenFile|QueryFullAttributesFile|QueryAtt
 def buscar_exe(indicado):
     if indicado:
         return indicado
-    candidatos = glob.glob(os.path.join(REPO, "build", "bin", "Windows", "*", "xenia_canary_netplay.exe"))
+    # Junto a la carpeta tools en el paquete de release, o en build/bin dentro del repositorio.
+    candidatos = glob.glob(os.path.join(REPO, "xenia_canary_netplay.exe"))
+    candidatos += glob.glob(os.path.join(REPO, "build", "bin", "Windows", "*", "xenia_canary_netplay.exe"))
     if not candidatos:
         sys.exit("No encuentro el .exe compilado: usa 'xb build' o indica --exe.")
     return max(candidatos, key=os.path.getmtime)

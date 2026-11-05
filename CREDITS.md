@@ -18,8 +18,13 @@ Se incluyen como submódulos en `third_party`, cada uno con su propia licencia:
 - [miniupnp](https://github.com/miniupnp/miniupnp)
 - [wolfSSL](https://github.com/wolfSSL/wolfssl)
 
-wolfSSL se ofrece bajo GPL o con licencia comercial. Antes de publicar binarios,
-revisa qué obligaciones añade la versión incluida.
+La versión incluida de wolfSSL usa GPLv3. La compilación para Windows no la enlaza,
+porque libcurl usa Schannel, pero la de Linux sí, así que un binario para Linux
+tendría que distribuirse bajo GPLv3.
+
+Los binarios para Windows incluyen FFmpeg (configurado como LGPL 2.1 o posterior),
+libusb y mspack, ambos con LGPL. Al publicarlos, incluye sus licencias e indica de
+qué commit de este repositorio salen, para que se puedan recompilar.
 
 ## Herramientas de este fork
 
