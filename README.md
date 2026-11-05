@@ -4,7 +4,11 @@
     </a>
 </p>
 
-<h1 align="center">Xenia Canary Netplay - Xbox 360 Emulator</h1>
+<h1 align="center">Xenia Canary Homebrew Dev - Xbox 360 Emulator</h1>
+
+Fork para probar juegos homebrew. Une Xenia Canary con [Xenia Canary Netplay](https://github.com/AdrianCassar/xenia-canary) y añade un simulador de red local, escritura en `game:\` y creación automática de carpetas. Consulta [tools/live_sim](tools/live_sim/README.md) y los [créditos](CREDITS.md).
+
+El resto de este documento procede de Xenia Canary Netplay.
 
 [![Release](https://img.shields.io/github/v/release/AdrianCassar/xenia-canary?label=release)](https://github.com/AdrianCassar/xenia-canary/releases/latest)
 [![CI](https://github.com/AdrianCassar/xenia-canary/actions/workflows/Orchestrator.yml/badge.svg?branch=netplay_canary_experimental)](https://github.com/AdrianCassar/xenia-canary/actions?query=branch%3Anetplay_canary_experimental)

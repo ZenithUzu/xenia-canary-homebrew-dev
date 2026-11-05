@@ -7,7 +7,9 @@
  ******************************************************************************
  */
 
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/utf8.h"
 #include "xenia/kernel/info/file.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
@@ -36,6 +38,18 @@ struct CreateOptions {
   // Optimization - file access will be random, not sequential.
   static constexpr uint32_t FILE_RANDOM_ACCESS = 0x00000800;
 };
+
+DEFINE_bool(auto_create_game_dirs, true,
+            "Create missing game:\\ folders when a title looks one up or writes "
+            "inside it. Requires allow_game_relative_writes. Homebrew often "
+            "expects its save folders to exist already.",
+            "General");
+
+// Paths under game: are the only ones this feature may create.
+static bool IsGameRelativePath(const std::string_view path) {
+  return cvars::auto_create_game_dirs &&
+         xe::utf8::starts_with_case(path, "game:\\");
+}
 
 dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
                                   pointer_t<X_OBJECT_ATTRIBUTES> object_attrs,
@@ -78,12 +92,34 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
     root_entry = root_file->entry();
   }
 
+  // Writing inside a missing game:\ folder creates that folder first.
+  const auto disposition = vfs::FileDisposition((uint32_t)creation_disposition);
+  if (!root_entry && IsGameRelativePath(target_path)) {
+    auto file_system = kernel_state()->file_system();
+    if (disposition == vfs::FileDisposition::kOpen &&
+        (create_options & CreateOptions::FILE_DIRECTORY_FILE)) {
+      // Listing a missing game:\ folder creates it too.
+      std::string directory(target_path);
+      while (!directory.empty() && directory.back() == '\\') {
+        directory.pop_back();
+      }
+      if (!file_system->ResolvePath(directory)) {
+        file_system->CreatePath(directory, vfs::kFileAttributeDirectory);
+      }
+    } else if (disposition != vfs::FileDisposition::kOpen &&
+               disposition != vfs::FileDisposition::kOverwrite) {
+      const auto base_path = xe::utf8::find_base_guest_path(target_path);
+      if (!base_path.empty() && !file_system->ResolvePath(base_path)) {
+        file_system->CreatePath(base_path, vfs::kFileAttributeDirectory);
+      }
+    }
+  }
+
   // Attempt open (or create).
   vfs::File* vfs_file;
   vfs::FileAction file_action;
   X_STATUS result = kernel_state()->file_system()->OpenFile(
-      root_entry, target_path,
-      vfs::FileDisposition((uint32_t)creation_disposition), desired_access,
+      root_entry, target_path, disposition, desired_access,
       (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0,
       (create_options & CreateOptions::FILE_NON_DIRECTORY_FILE) != 0, &vfs_file,
       &file_action);
@@ -494,6 +530,15 @@ dword_result_t NtQueryFullAttributesFile_entry(
 
   // Resolve the file using the virtual file system.
   auto entry = kernel_state()->file_system()->ResolvePath(target_path);
+
+  // A missing game:\ path without an extension is treated as a folder.
+  if (!entry && IsGameRelativePath(target_path) &&
+      xe::utf8::find_name_from_guest_path(target_path).find('.') ==
+          std::string::npos) {
+    entry = kernel_state()->file_system()->CreatePath(
+        target_path, vfs::kFileAttributeDirectory);
+  }
+
   if (entry) {
     // Found.
     file_info->creation_time = entry->create_timestamp();
