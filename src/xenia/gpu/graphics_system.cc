@@ -10,6 +10,7 @@
 #include "xenia/gpu/graphics_system.h"
 
 #include <charconv>
+#include <chrono>
 
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
@@ -370,6 +371,23 @@ uint32_t GraphicsSystem::ReadRegister(uint32_t addr) {
       return 0x0000200E;
     case 0x0F2D:  // RB_HSIO_INTERFACE_ALIGNER_VALUE
       return 0x00BBBBBB;
+    case 0x183B:  // D1CRTC_DOUBLE_BUFFER_CONTROL
+      // The display takes a new surface at once and clears the request. Titles
+      // that drive the display directly, such as xSDK's, wait for this.
+      return 0;
+    case 0x1928:  // DC_LUT_AUTOFILL
+      // Bit 1 reports that the autofill finished; there is no LUT to fill.
+      return register_file()->values[r] | 0x2;
+    case 0x194C: {  // R500_D1MODE_V_COUNTER
+      // The line being scanned out, for 750 lines per frame at 59.94 Hz.
+      constexpr uint64_t kFrameNanoseconds = 16683333;
+      constexpr uint64_t kLinesPerFrame = 750;
+      const uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+      return uint32_t((now % kFrameNanoseconds) * kLinesPerFrame /
+                      kFrameNanoseconds);
+    }
     case 0x1951:  // interrupt status
       return 1;   // vblank
     case 0x1961:  // AVIVO_D1MODE_VIEWPORT_SIZE

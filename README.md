@@ -18,6 +18,7 @@ Fork de [Xenia Canary](https://github.com/xenia-canary/xenia-canary) para desarr
 | **Escritura en `game:\`** | `allow_game_relative_writes` viene activado. |
 | **Carpetas automáticas** | `auto_create_game_dirs` crea las carpetas de `game:\` que el juego pide. |
 | **Archivos faltantes** | El lanzador anota en `faltantes.txt` los archivos que el juego pidió y no encontró. |
+| **Compatibilidad con [xSDK](https://github.com/ZenithUzu/xsdk)** | Xenia responde a los registros del controlador de pantalla que usa xSDK e implementa `GetTimeZoneInformation`. |
 
 De Netplay también llegan las sesiones por Xenia Web Services, Systemlink, UPnP, amigos y XStorage. El aviso de actualizaciones viene desactivado porque apunta a las versiones de Netplay.
 
@@ -50,7 +51,8 @@ Probado en una compilación Release para Windows:
 |---|---|
 | `net_probe`, incluida una petición HTTP real | 36 de 38 comprobaciones correctas; `XSessionStart` y `XSessionEnd` fallan porque la prueba no registra el arbitraje |
 | AdvanXe360 | Abre, crea `Roms` y conecta con GitHub por HTTPS; la descarga de portadas no se ha probado en este fork |
-| `sm64coopdx` | Crea `save`, pero se cierra al iniciar la pantalla (`present_open`) antes de usar la red |
+| `sm64coopdx` | Crea `save`, abre la pantalla y dibuja su menú; pide la ROM, así que la partida y su red no se han probado |
+| xDS360 | Abre la pantalla y presenta frames; pide `game.nds`, así que la emulación no se ha probado |
 
 ## Límites
 

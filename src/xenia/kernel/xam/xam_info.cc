@@ -7,6 +7,9 @@
  ******************************************************************************
  */
 
+#include <cstring>
+#include <ctime>
+
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
@@ -1073,6 +1076,44 @@ void GetSystemTimeAsFileTime_entry(lpqword_t time_ptr,
   }
 }
 DECLARE_XAM_EXPORT1(GetSystemTimeAsFileTime, kNone, kImplemented);
+
+struct X_TIME_ZONE_INFORMATION {
+  xe::be<int32_t> bias;
+  xe::be<uint16_t> standard_name[32];
+  xe::be<uint16_t> standard_date[8];
+  xe::be<int32_t> standard_bias;
+  xe::be<uint16_t> daylight_name[32];
+  xe::be<uint16_t> daylight_date[8];
+  xe::be<int32_t> daylight_bias;
+};
+static_assert_size(X_TIME_ZONE_INFORMATION, 172);
+
+// Reports the host's current offset from UTC as a zone without daylight saving.
+dword_result_t GetTimeZoneInformation_entry(
+    pointer_t<X_TIME_ZONE_INFORMATION> info) {
+  constexpr uint32_t kTimeZoneIdInvalid = 0xFFFFFFFF;
+  constexpr uint32_t kTimeZoneIdUnknown = 0;
+  if (!info) {
+    return kTimeZoneIdInvalid;
+  }
+
+  std::memset(static_cast<X_TIME_ZONE_INFORMATION*>(info), 0,
+              sizeof(X_TIME_ZONE_INFORMATION));
+
+  const std::time_t now = std::time(nullptr);
+  std::tm utc = *std::gmtime(&now);
+  std::tm local = *std::localtime(&now);
+  utc.tm_isdst = local.tm_isdst;
+  info->bias = int32_t(std::difftime(std::mktime(&utc), now) / 60);
+
+  static constexpr char kName[] = "LOCAL";
+  for (size_t i = 0; i + 1 < sizeof(kName); ++i) {
+    info->standard_name[i] = uint16_t(kName[i]);
+    info->daylight_name[i] = uint16_t(kName[i]);
+  }
+  return kTimeZoneIdUnknown;
+}
+DECLARE_XAM_EXPORT1(GetTimeZoneInformation, kNone, kImplemented);
 
 dword_result_t XamIsIptvEnabled_entry() {
   const bool iptv_enabled =
